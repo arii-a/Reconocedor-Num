@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reconocedor de dígitos</title>
+<meta name="description" content="Dibuja un número del 0 al 9 y una red neuronal intenta adivinarlo, directamente en tu navegador.">
+<style>
+  :root {
+    --bg1: #f4f5fc; --bg2: #e2e6f6; --card: #ffffff; --frame: #dee2f1;
+    --ink: #232842; --muted: #8a90a8; --accent: #5b5bf0;
+    --btn: #eef0f8; --btn-hover: #e0e4f4; --btn-ink: #232842;
+    --track: #e6e9f4; --bar: #cfd3e6; --boardink: #232842;
+    --good: #22a06b; --mid: #e0a020; --bad: #e5484d;
+    --shadow: 0 10px 30px rgba(60, 70, 130, .18);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg1: #151827; --bg2: #0d0f19; --card: #1c2033; --frame: #2b3150;
+      --ink: #eceefb; --muted: #9096b3; --btn: #2a2f48; --btn-hover: #353b5a; --btn-ink: #eceefb;
+      --track: #2b3150; --shadow: 0 10px 30px rgba(0, 0, 0, .45);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg1: #151827; --bg2: #0d0f19; --card: #1c2033; --frame: #2b3150;
+    --ink: #eceefb; --muted: #9096b3; --btn: #2a2f48; --btn-hover: #353b5a; --btn-ink: #eceefb;
+    --track: #2b3150; --shadow: 0 10px 30px rgba(0, 0, 0, .45);
+  }
+  [hidden] { display: none !important; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; color: var(--ink);
+    background: var(--bg2) linear-gradient(var(--bg1), var(--bg2)) fixed;
+    font-family: "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+  }
+  main { max-width: 900px; margin: 0 auto; padding: 28px 16px 40px; }
+  h1 { margin: 0; font-size: 1.9rem; letter-spacing: -.01em; }
+  .sub { margin: 6px 0 24px; color: var(--muted); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
+  @media (max-width: 760px) { .grid { grid-template-columns: 1fr; gap: 20px; } }
+  .card { background: var(--card); border-radius: 24px; padding: 20px; box-shadow: var(--shadow); }
+  .frame { background: var(--frame); padding: 4px; border-radius: 10px; }
+  .board { position: relative; aspect-ratio: 1; background: #fff; container-type: inline-size; overflow: hidden; }
+  #draw { width: 100%; height: 100%; display: block; touch-action: none; cursor: crosshair; }
+
+  .toolbar { display: flex; align-items: center; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+  .toolbar .sep { flex: 1; }
+  button.tool {
+    width: 52px; height: 52px; border: 0; border-radius: 14px; cursor: pointer;
+    background: var(--btn); color: var(--btn-ink); display: grid; place-items: center; transition: background .12s;
+  }
+  button.tool:hover { background: var(--btn-hover); }
+  button.tool.active { background: var(--accent); color: #fff; }
+  button.tool:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  button.tool svg { width: 26px; height: 26px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  button.size { width: 40px; height: 40px; border-radius: 12px; }
+  button.size i { display: block; border-radius: 50%; background: currentColor; }
+
+  @media (max-width: 420px) {
+    .toolbar { gap: 6px; flex-wrap: nowrap; }
+    button.tool { width: 46px; height: 46px; }
+    button.size { width: 34px; height: 34px; }
+    .card { padding: 16px; }
+  }
+  .out { display: grid; place-items: center; }
+  .big { font-size: 58cqw; font-weight: 700; line-height: 1; color: var(--boardink); margin-top: -12cqw; }
+  .big.idle { color: #dde0ee; }
+  .big.low { color: #8a90a8; }
+  .wait { position: absolute; left: 0; right: 0; bottom: 14%; text-align: center; color: var(--muted); font-size: .95rem; }
+  .thumb { position: absolute; top: 10px; right: 10px; text-align: center; font-size: .65rem; color: var(--muted); }
+  .thumb canvas { width: 64px; height: 64px; display: block; background: #000; border: 2px solid var(--frame); image-rendering: pixelated; }
+  .bars { position: absolute; left: 0; right: 0; bottom: 8px; display: flex; justify-content: center; gap: 2.6cqw; }
+  .bars div { display: flex; flex-direction: column; align-items: center; gap: 4px; font-size: .75rem; color: var(--muted); width: 6cqw; }
+  .bars .track { width: 100%; height: 56px; display: flex; align-items: flex-end; }
+  .bars .fill { width: 100%; min-height: 6px; border-radius: 99px; background: var(--bar); transition: height .2s; }
+  .bars .on { color: var(--boardink); font-weight: 700; }
+
+  .info { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 16px; }
+  .info small { display: block; color: var(--muted); font-size: .8rem; }
+  .info strong { font-size: 2rem; line-height: 1.2; }
+  .progress { grid-column: 1 / -1; height: 10px; border-radius: 99px; background: var(--track); overflow: hidden; margin-top: 4px; }
+  .progress i { display: block; height: 100%; width: 0; border-radius: 99px; background: var(--muted); transition: width .25s, background .25s; }
+  #hint { min-height: 1.3em; color: var(--muted); font-size: .85rem; margin: 10px 2px 0; }
+  .note { margin-top: 18px; text-align: center; color: var(--muted); font-size: .85rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Reconocedor de dígitos</h1>
+  <p class="sub">Dibuja un número del 0 al 9 y la IA intentará adivinarlo. Todo ocurre en tu navegador.</p>
+
+  <div class="grid">
+    <section class="card" aria-label="Pizarra de dibujo">
+      <div class="frame"><div class="board"><canvas id="draw" width="340" height="340"></canvas></div></div>
+      <div class="toolbar">
+        <button class="tool active" id="pencil" title="Lápiz" aria-label="Lápiz">
+          <svg viewBox="0 0 24 24"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
+        </button>
+        <button class="tool" id="eraser" title="Borrador" aria-label="Borrador">
+          <svg viewBox="0 0 24 24"><path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21"/><path d="M22 21H7"/><path d="m5 11 9 9"/></svg>
+        </button>
+        <button class="tool" id="clear" title="Limpiar todo" aria-label="Limpiar todo">
+          <svg viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+        </button>
+        <span class="sep"></span>
+        <button class="tool size" data-size="10" title="Trazo fino" aria-label="Trazo fino"><i style="width:5px;height:5px"></i></button>
+        <button class="tool size active" data-size="20" title="Trazo medio" aria-label="Trazo medio"><i style="width:10px;height:10px"></i></button>
+        <button class="tool size" data-size="34" title="Trazo grueso" aria-label="Trazo grueso"><i style="width:16px;height:16px"></i></button>
+      </div>
+      <p id="hint"></p>
+    </section>
+
+    <section class="card" aria-label="Resultado" aria-live="polite">
+      <div class="frame"><div class="board out">
+        <div class="big idle" id="big">?</div>
+        <div class="wait" id="wait">Cargando modelo…</div>
+        <div class="thumb" id="thumb" hidden><canvas id="thumbCanvas" width="28" height="28"></canvas>lo que ve el modelo</div>
+        <div class="bars" id="bars" hidden></div>
+      </div></div>
+      <div class="info">
+        <div><small>Número predicho</small><strong id="num">—</strong></div>
+        <div><small>Confianza</small><strong id="conf">—</strong></div>
+        <div class="progress"><i id="bar"></i></div>
+      </div>
+    </section>
+  </div>
+  <p class="note">Red neuronal convolucional entrenada con MNIST · corre localmente, tu dibujo no se envía a ningún servidor.</p>
+</main>
+
+<script src="net.js"></script>
+<script src="weights.js"></script>
+<script>
+(() => {
+  const B = 340, MEAN = 0.1307, STD = 0.3081;
+  const $ = (id) => document.getElementById(id);
+  const cv = $("draw"), ctx = cv.getContext("2d", { willReadFrequently: true });
+  let tool = "pencil", size = 20, last = null, timer = null, net = null;
+
+  // ---------- Dibujo ----------
+  const blank = () => { ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, B, B); };
+  blank();
+  const pos = (e) => {
+    const r = cv.getBoundingClientRect();
+    return [(e.clientX - r.left) * (B / r.width), (e.clientY - r.top) * (B / r.height)];
+  };
+  function stroke(a, b) {
+    ctx.strokeStyle = tool === "eraser" ? "#fff" : "#232842";
+    ctx.lineWidth = size * (tool === "eraser" ? 2.2 : 1);
+    ctx.lineCap = ctx.lineJoin = "round";
+    ctx.beginPath(); ctx.moveTo(...a); ctx.lineTo(...b); ctx.stroke();
+  }
+  cv.addEventListener("pointerdown", (e) => {
+    cv.setPointerCapture(e.pointerId);
+    last = pos(e); stroke(last, last); schedule(450);
+  });
+  cv.addEventListener("pointermove", (e) => {
+    if (!last) return;
+    const p = pos(e); stroke(last, p); last = p; schedule(450);
+  });
+  const up = () => { if (last) { last = null; schedule(0); } };
+  cv.addEventListener("pointerup", up);
+  cv.addEventListener("pointercancel", up);
+
+  function schedule(ms) { clearTimeout(timer); timer = setTimeout(predict, ms); }
+
+  // ---------- Herramientas ----------
+  const setTool = (t) => {
+    tool = t;
+    $("pencil").classList.toggle("active", t === "pencil");
+    $("eraser").classList.toggle("active", t === "eraser");
+  };
+  $("pencil").onclick = () => setTool("pencil");
+  $("eraser").onclick = () => setTool("eraser");
+  $("clear").onclick = () => { blank(); idle(); };
+  document.querySelectorAll(".size").forEach((b) => b.onclick = () => {
+    size = +b.dataset.size;
+    document.querySelectorAll(".size").forEach((x) => x.classList.toggle("active", x === b));
+  });
+  document.querySelectorAll("button.tool").forEach((b) => {
+    b.addEventListener("mouseenter", () => $("hint").textContent = b.title);
+    b.addEventListener("mouseleave", () => $("hint").textContent = "");
+  });
+
+  // ---------- Preprocesado (igual que preprocess.py) ----------
+  function preprocess() {
+    const d = ctx.getImageData(0, 0, B, B).data;
+    const ink = new Float32Array(B * B);  // trazo claro sobre fondo oscuro, 0..255
+    let x0 = B, y0 = B, x1 = -1, y1 = -1;
+    for (let i = 0; i < B * B; i++) {
+      const v = 255 - (0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2]);
+      ink[i] = v < 20 ? 0 : v;
+      if (ink[i] > 0) {
+        const x = i % B, y = (i / B) | 0;
+        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      }
+    }
+    if (x1 < 0) return null;
+    const w = x1 - x0 + 1, h = y1 - y0 + 1, s = 20 / Math.max(w, h);
+    const tw = Math.max(1, Math.round(w * s)), th = Math.max(1, Math.round(h * s));
+
+    // reduccion por promedio de area (caja) a tw x th
+    const patch = new Float32Array(tw * th);
+    for (let ty = 0; ty < th; ty++) {
+      const sy0 = y0 + ty * h / th, sy1 = y0 + (ty + 1) * h / th;
+      for (let tx = 0; tx < tw; tx++) {
+        const sx0 = x0 + tx * w / tw, sx1 = x0 + (tx + 1) * w / tw;
+        let sum = 0, area = 0;
+        for (let y = Math.floor(sy0); y < Math.ceil(sy1); y++) {
+          const wy = Math.min(y + 1, sy1) - Math.max(y, sy0);
+          for (let x = Math.floor(sx0); x < Math.ceil(sx1); x++) {
+            const wx = Math.min(x + 1, sx1) - Math.max(x, sx0), a = wx * wy;
+            sum += ink[y * B + x] * a; area += a;
+          }
+        }
+        patch[ty * tw + tx] = sum / area;
+      }
+    }
+    // centrar por centro de masa en 28x28 (como MNIST)
+    let m = 0, cy = 0, cx = 0;
+    for (let y = 0; y < th; y++) for (let x = 0; x < tw; x++) { const v = patch[y * tw + x]; m += v; cy += v * y; cx += v * x; }
+    cy /= m || 1; cx /= m || 1;
+    const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
+    const oy = clamp(Math.round(14 - cy), 0, 28 - th), ox = clamp(Math.round(14 - cx), 0, 28 - tw);
+    const img = new Float32Array(784);
+    for (let y = 0; y < th; y++) for (let x = 0; x < tw; x++) img[(oy + y) * 28 + ox + x] = patch[y * tw + x];
+    return img;
+  }
+
+  // ---------- Prediccion y resultado ----------
+  function predict() {
+    timer = null;
+    if (!net) return;
+    const img = preprocess();
+    if (!img) return idle();
+    const input = Float32Array.from(img, (v) => (v / 255 - MEAN) / STD);
+    const p = net.predict(input);
+    show(p, img);
+  }
+
+  const barsEl = $("bars");
+  for (let i = 0; i < 10; i++) barsEl.insertAdjacentHTML("beforeend",
+    `<div><span class="track"><span class="fill" style="height:6px"></span></span><span>${i}</span></div>`);
+
+  function idle() {
+    $("big").textContent = "?"; $("big").className = "big idle";
+    $("wait").hidden = false; $("wait").textContent = net ? "Esperando tu dibujo…" : "Cargando modelo…";
+    $("thumb").hidden = $("bars").hidden = true;
+    $("num").textContent = $("conf").textContent = "—";
+    $("conf").style.color = ""; $("bar").style.width = "0";
+  }
+
+  function show(p, img) {
+    const digit = p.indexOf(Math.max(...p)), conf = p[digit];
+    const color = conf >= .8 ? "var(--good)" : conf >= .5 ? "var(--mid)" : "var(--bad)";
+    $("big").textContent = digit; $("big").className = "big" + (conf < .5 ? " low" : "");
+    $("wait").hidden = true; $("thumb").hidden = $("bars").hidden = false;
+
+    const t = $("thumbCanvas").getContext("2d"), id = t.createImageData(28, 28);
+    for (let i = 0; i < 784; i++) { id.data.set([img[i], img[i], img[i], 255], i * 4); }
+    t.putImageData(id, 0, 0);
+
+    [...barsEl.children].forEach((c, i) => {
+      const f = c.querySelector(".fill");
+      f.style.height = Math.max(6, p[i] * 56) + "px";
+      f.style.background = i === digit ? color : "";
+      c.classList.toggle("on", i === digit);
+    });
+    $("num").textContent = conf < .5 ? digit + "?" : digit;
+    $("conf").textContent = (conf * 100).toFixed(1) + " %"; $("conf").style.color = color;
+    $("bar").style.width = conf * 100 + "%"; $("bar").style.background = color;
+  }
+
+  // ---------- Carga del modelo ----------
+  try {
+    net = createNet(WEIGHTS.width, WEIGHTS.data);
+    idle();
+  } catch (e) {
+    $("wait").textContent = "No se pudo cargar el modelo: " + e.message;
+  }
+})();
+</script>
+</body>
+</html>
