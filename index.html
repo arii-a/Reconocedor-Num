@@ -36,6 +36,17 @@
   main { max-width: 900px; margin: 0 auto; padding: 28px 16px 40px; }
   h1 { margin: 0; font-size: 1.9rem; letter-spacing: -.01em; }
   .sub { margin: 6px 0 24px; color: var(--muted); }
+  .head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+  .models { display: flex; align-items: center; gap: 4px; background: var(--btn); padding: 4px; border-radius: 999px; margin-top: 4px; }
+  .models small { color: var(--muted); padding: 0 8px 0 12px; font-size: .8rem; }
+  .seg { border: 0; background: transparent; color: var(--btn-ink); padding: 7px 16px; border-radius: 999px; font: inherit; font-size: .88rem; cursor: pointer; }
+  .seg.active { background: var(--accent); color: #fff; }
+  .seg:disabled { opacity: .4; cursor: not-allowed; }
+  .seg:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .other { display: flex; justify-content: space-between; gap: 8px; margin: 14px 0 0; padding: 10px 14px; border-radius: 12px;
+    background: var(--btn); font-size: .9rem; color: var(--muted); }
+  .other strong { color: var(--btn-ink); }
+  .other.diff { box-shadow: inset 0 0 0 2px var(--mid); }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
   @media (max-width: 760px) { .grid { grid-template-columns: 1fr; gap: 20px; } }
   .card { background: var(--card); border-radius: 24px; padding: 20px; box-shadow: var(--shadow); }
@@ -99,8 +110,17 @@
 </head>
 <body>
 <main>
-  <h1>Reconocedor de dígitos</h1>
-  <p class="sub">Dibuja un número del 0 al 9 y la IA intentará adivinarlo. Todo ocurre en tu navegador.</p>
+  <header class="head">
+    <div>
+      <h1>Reconocedor de dígitos</h1>
+      <p class="sub">Dibuja un número del 0 al 9 y la IA intentará adivinarlo. Todo ocurre en tu navegador.</p>
+    </div>
+    <div class="models" id="models" role="group" aria-label="Modelo">
+      <small>Modelo</small>
+      <button class="seg active" data-m="anterior" type="button">Anterior</button>
+      <button class="seg" data-m="nuevo" type="button">Nuevo</button>
+    </div>
+  </header>
 
   <div class="grid">
     <section class="card" aria-label="Pizarra de dibujo">
@@ -142,19 +162,23 @@
         <div><small>Confianza</small><strong id="conf">—</strong></div>
         <div class="progress"><i id="bar"></i></div>
       </div>
+      <p class="other" id="other" hidden><span id="otherName"></span><strong id="otherVal"></strong></p>
     </section>
   </div>
-  <p class="note">Dibuja, o sube, arrastra o pega (Ctrl+V) una foto de un dígito. Red neuronal entrenada con MNIST · corre en tu navegador, nada se envía a ningún servidor.</p>
+  <p class="note">Dibuja, o sube, arrastra o pega (Ctrl+V) una foto de un dígito. Red neuronal convolucional · corre en tu navegador, nada se envía a ningún servidor.</p>
 </main>
 
 <script src="net.js"></script>
-<script src="weights.js"></script>
+<script src="models/anterior.js"></script>
+<script src="models/nuevo.js" onerror="console.info('Modelo nuevo: aún no disponible')"></script>
 <script>
 (() => {
   const B = 340, MEAN = 0.1307, STD = 0.3081;
   const $ = (id) => document.getElementById(id);
   const cv = $("draw"), ctx = cv.getContext("2d", { willReadFrequently: true });
-  let tool = "pencil", size = 20, last = null, timer = null, net = null;
+  let tool = "pencil", size = 20, last = null, timer = null;
+  const MODELS = window.MODELS || {}, ORDER = ["anterior", "nuevo"], NAMES = { anterior: "Anterior", nuevo: "Nuevo" };
+  const nets = {}; let current = "anterior", predictToken = 0;
   let photo = null, photoMode = false, cropTouched = false, view = null, crop = null;
 
   // ---------- Dibujo ----------
@@ -229,16 +253,63 @@
     return out;
   }
 
+  // Mediana de un canal de color (el fondo es el color mas comun)
+  function channelMedian(d, n, off) {
+    const h = new Uint32Array(256);
+    for (let i = 0; i < n; i++) h[d[4 * i + off]]++;
+    let acc = 0;
+    for (let t = 0; t < 256; t++) { acc += h[t]; if (acc >= n / 2) return t; }
+    return 127;
+  }
+
+  // Dilatacion en escala de grises (maximo en ventana cuadrada, separable)
+  function dilate(src, w, h, r) {
+    const tmp = new Float32Array(src.length), out = new Float32Array(src.length);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      let m = 0; const x0 = Math.max(0, x - r), x1 = Math.min(w - 1, x + r);
+      for (let k = x0; k <= x1; k++) { const v = src[y * w + k]; if (v > m) m = v; }
+      tmp[y * w + x] = m;
+    }
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      let m = 0; const y0 = Math.max(0, y - r), y1 = Math.min(h - 1, y + r);
+      for (let k = y0; k <= y1; k++) { const v = tmp[k * w + x]; if (v > m) m = v; }
+      out[y * w + x] = m;
+    }
+    return out;
+  }
+
+  // Reduccion por promedio de area (caja): region (ox,oy,w,h) de src -> tw x th
+  function boxResize(src, stride, ox, oy, w, h, tw, th) {
+    const out = new Float32Array(tw * th);
+    for (let ty = 0; ty < th; ty++) {
+      const sy0 = oy + ty * h / th, sy1 = oy + (ty + 1) * h / th;
+      for (let tx = 0; tx < tw; tx++) {
+        const sx0 = ox + tx * w / tw, sx1 = ox + (tx + 1) * w / tw;
+        let sum = 0, ar = 0;
+        for (let y = Math.floor(sy0); y < Math.ceil(sy1); y++) {
+          const wy = Math.min(y + 1, sy1) - Math.max(y, sy0);
+          for (let x = Math.floor(sx0); x < Math.ceil(sx1); x++) {
+            const wx = Math.min(x + 1, sx1) - Math.max(x, sx0), k = wx * wy;
+            sum += src[y * stride + x] * k; ar += k;
+          }
+        }
+        out[ty * tw + tx] = sum / ar;
+      }
+    }
+    return out;
+  }
+
   function preprocess(c2d) {
     const d = c2d.getImageData(0, 0, B, B).data, n = B * B;
-    const g = new Float32Array(n), hist = new Uint32Array(256);
-    for (let i = 0; i < n; i++) { g[i] = 0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2]; hist[Math.round(g[i])]++; }
 
-    // Fondo = valor mas comun. MNIST: digito claro sobre fondo oscuro -> invertir si el fondo es claro
-    let acc = 0, med = 0;
-    for (let t = 0; t < 256; t++) { acc += hist[t]; if (acc >= n / 2) { med = t; break; } }
+    // Trazo = lo que se aleja del color de fondo (sirve con tinta oscura, clara o de color,
+    // y no depende de si el fondo es claro u oscuro)
+    const mr = channelMedian(d, n, 0), mg = channelMedian(d, n, 1), mb = channelMedian(d, n, 2);
     const a = new Float32Array(n);
-    for (let i = 0; i < n; i++) a[i] = med > 127 ? 255 - g[i] : g[i];
+    for (let i = 0; i < n; i++) {
+      const dr = d[4 * i] - mr, dg = d[4 * i + 1] - mg, db = d[4 * i + 2] - mb;
+      a[i] = Math.min(255, Math.sqrt((dr * dr + dg * dg + db * db) / 3));
+    }
 
     const thr = otsu(a);
     let mask = new Uint8Array(n);
@@ -248,36 +319,60 @@
       if (c.reduce((s, v) => s + v, 0) >= 15) mask = c;
     }
 
-    let x0 = B, y0 = B, x1 = -1, y1 = -1, amax = 1;
-    for (let i = 0; i < n; i++) if (mask[i]) {
-      const x = i % B, y = (i / B) | 0;
-      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
-      if (a[i] > amax) amax = a[i];
-    }
-    if (x1 < 0) return null;
-    const ink = new Float32Array(n);
+    const bbox = (m) => {
+      let x0 = B, y0 = B, x1 = -1, y1 = -1;
+      for (let i = 0; i < n; i++) if (m[i]) {
+        const x = i % B, y = (i / B) | 0;
+        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      }
+      return x1 < 0 ? null : { x0, y0, x1, y1 };
+    };
+    let bb = bbox(mask);
+    if (!bb) return null;
+
+    let ink = new Float32Array(n), amax = 1;
+    for (let i = 0; i < n; i++) if (mask[i] && a[i] > amax) amax = a[i];
     for (let i = 0; i < n; i++) ink[i] = mask[i] ? a[i] / amax * 255 : 0;
 
-    const w = x1 - x0 + 1, h = y1 - y0 + 1, s = 20 / Math.max(w, h);
-    const tw = Math.max(1, Math.round(w * s)), th = Math.max(1, Math.round(h * s));
-
-    // reduccion por promedio de area (caja) a tw x th
-    const patch = new Float32Array(tw * th);
-    for (let ty = 0; ty < th; ty++) {
-      const sy0 = y0 + ty * h / th, sy1 = y0 + (ty + 1) * h / th;
-      for (let tx = 0; tx < tw; tx++) {
-        const sx0 = x0 + tx * w / tw, sx1 = x0 + (tx + 1) * w / tw;
-        let sum = 0, area = 0;
-        for (let y = Math.floor(sy0); y < Math.ceil(sy1); y++) {
-          const wy = Math.min(y + 1, sy1) - Math.max(y, sy0);
-          for (let x = Math.floor(sx0); x < Math.ceil(sx1); x++) {
-            const wx = Math.min(x + 1, sx1) - Math.max(x, sx0), ar = wx * wy;
-            sum += ink[y * B + x] * ar; area += ar;
-          }
+    // Trazo muy fino (lapiz, boligrafo, marcador): engrosarlo hasta algo parecido a MNIST.
+    // grosor estimado = 2 * area / perimetro
+    let area = 0, per = 0;
+    for (let y = bb.y0; y <= bb.y1; y++) for (let x = bb.x0; x <= bb.x1; x++) {
+      if (!mask[y * B + x]) continue;
+      area++;
+      if (x === 0 || y === 0 || x === B - 1 || y === B - 1 || !mask[y * B + x - 1] || !mask[y * B + x + 1] ||
+          !mask[(y - 1) * B + x] || !mask[(y + 1) * B + x]) per++;
+    }
+    let sx = bb.x0, sy = bb.y0, bw = bb.x1 - bb.x0 + 1, bh = bb.y1 - bb.y0 + 1, src = ink, stride = B;
+    const hmax = Math.max(bw, bh), sw = per ? 2 * area / per : 0;
+    if (sw < 0.05 * hmax) {
+      const rFull = Math.min(14, Math.ceil((0.075 * hmax - sw) / 2));
+      if (rFull >= 1) {
+        // trabajar en una version reducida (~96 px): la dilatacion es ~10 veces mas barata
+        const k = Math.min(1, 96 / hmax), m = rFull + 1;
+        const cx0 = Math.max(0, bb.x0 - m), cy0 = Math.max(0, bb.y0 - m);
+        const cw = Math.min(B, bb.x1 + m + 1) - cx0, ch = Math.min(B, bb.y1 + m + 1) - cy0;
+        const W2 = Math.max(1, Math.round(cw * k)), H2 = Math.max(1, Math.round(ch * k));
+        let small = boxResize(ink, B, cx0, cy0, cw, ch, W2, H2);
+        small = dilate(small, W2, H2, Math.max(1, Math.round(rFull * k)));
+        let x0 = W2, y0 = H2, x1 = -1, y1 = -1;
+        for (let i = 0; i < small.length; i++) if (small[i] > 1) {
+          const x = i % W2, y = (i / W2) | 0;
+          if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
         }
-        patch[ty * tw + tx] = sum / area;
+        if (x1 >= 0) { src = small; stride = W2; sx = x0; sy = y0; bw = x1 - x0 + 1; bh = y1 - y0 + 1; }
       }
     }
+
+    const s = 20 / Math.max(bw, bh);
+    const tw = Math.max(1, Math.round(bw * s)), th = Math.max(1, Math.round(bh * s));
+    const patch = boxResize(src, stride, sx, sy, bw, bh, tw, th);
+
+    // el trazo mas intenso vuelve a 255 (como en MNIST)
+    let pmax = 1;
+    for (let i = 0; i < patch.length; i++) if (patch[i] > pmax) pmax = patch[i];
+    for (let i = 0; i < patch.length; i++) patch[i] = patch[i] / pmax * 255;
+
     // centrar por centro de masa en 28x28 (como MNIST)
     let m = 0, cy = 0, cx = 0;
     for (let y = 0; y < th; y++) for (let x = 0; x < tw; x++) { const v = patch[y * tw + x]; m += v; cy += v * y; cx += v * x; }
@@ -407,12 +502,23 @@
   // ---------- Prediccion y resultado ----------
   function predict() {
     timer = null;
-    if (!net) return;
+    if (!nets[current]) return;
     const img = preprocess(photoMode ? renderCrop() : ctx);
     if (!img) return idle();
     const input = Float32Array.from(img, (v) => (v / 255 - MEAN) / STD);
-    const p = net.predict(input);
+    const p = nets[current].predict(input);
     show(p, img);
+
+    // El otro modelo se calcula despues, para que la pantalla responda primero
+    const tok = ++predictToken, other = ORDER.find((k) => k !== current && nets[k]);
+    if (!other) { $("other").hidden = true; return; }
+    setTimeout(() => {
+      if (tok !== predictToken) return;
+      const q = nets[other].predict(input), d = q.indexOf(Math.max(...q)), dm = p.indexOf(Math.max(...p));
+      $("otherName").textContent = "Con el modelo " + NAMES[other].toLowerCase() + ":";
+      $("otherVal").textContent = d + " · " + (q[d] * 100).toFixed(1) + " %" + (d !== dm ? "  ≠" : "");
+      $("other").classList.toggle("diff", d !== dm); $("other").hidden = false;
+    }, 0);
   }
 
   const barsEl = $("bars");
@@ -421,7 +527,8 @@
 
   function idle() {
     $("big").textContent = "?"; $("big").className = "big idle";
-    $("wait").hidden = false; $("wait").textContent = net ? "Esperando tu dibujo…" : "Cargando modelo…";
+    $("wait").hidden = false; $("wait").textContent = Object.keys(nets).length ? "Esperando tu dibujo…" : "Cargando modelo…";
+    $("other").hidden = true;
     $("thumb").hidden = $("bars").hidden = true;
     $("num").textContent = $("conf").textContent = "—";
     $("conf").style.color = ""; $("bar").style.width = "0";
@@ -448,13 +555,26 @@
     $("bar").style.width = conf * 100 + "%"; $("bar").style.background = color;
   }
 
-  // ---------- Carga del modelo ----------
-  try {
-    net = createNet(WEIGHTS.width, WEIGHTS.data);
-    idle();
-  } catch (e) {
-    $("wait").textContent = "No se pudo cargar el modelo: " + e.message;
+  // ---------- Carga de modelos y selector ----------
+  for (const k of ORDER) {
+    if (!MODELS[k]) continue;
+    try { nets[k] = createNet(MODELS[k].width, MODELS[k].data); }
+    catch (e) { console.error("Modelo " + k + ":", e); }
   }
+  if (!nets[current]) current = ORDER.find((k) => nets[k]) || current;
+  document.querySelectorAll(".seg").forEach((b) => {
+    const k = b.dataset.m;
+    b.disabled = !nets[k];
+    b.title = nets[k] ? (MODELS[k].label || NAMES[k]) : "Aún no disponible";
+    b.classList.toggle("active", k === current);
+    b.onclick = () => {
+      current = k;
+      document.querySelectorAll(".seg").forEach((x) => x.classList.toggle("active", x === b));
+      schedule(0);  // recalcular con el modelo elegido
+    };
+  });
+  if (Object.keys(nets).length) idle();
+  else $("wait").textContent = "No se pudo cargar ningún modelo.";
 })();
 </script>
 </body>
