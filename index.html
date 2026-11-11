@@ -41,6 +41,15 @@
   .card { background: var(--card); border-radius: 24px; padding: 20px; box-shadow: var(--shadow); }
   .frame { background: var(--frame); padding: 4px; border-radius: 10px; transition: box-shadow .12s; }
   .frame.drop { box-shadow: 0 0 0 4px var(--accent); }
+  .cropLayer { position: absolute; inset: 0; touch-action: none; cursor: crosshair; user-select: none; -webkit-user-select: none; }
+  .cropbox { position: absolute; border: 2px solid #fff; outline: 2px solid var(--accent); cursor: move;
+    box-shadow: 0 0 0 9999px rgba(10, 12, 30, .55); }
+  .cropbox i { position: absolute; width: 22px; height: 22px; background: var(--accent); border: 2px solid #fff; border-radius: 50%; }
+  .cropbox i[data-h="nw"] { left: -2px; top: -2px; cursor: nwse-resize; }
+  .cropbox i[data-h="ne"] { right: -2px; top: -2px; cursor: nesw-resize; }
+  .cropbox i[data-h="sw"] { left: -2px; bottom: -2px; cursor: nesw-resize; }
+  .cropbox i[data-h="se"] { right: -2px; bottom: -2px; cursor: nwse-resize; }
+  #cropHint { color: var(--muted); font-size: .85rem; margin: 10px 2px 0; }
   .board { position: relative; aspect-ratio: 1; background: #fff; container-type: inline-size; overflow: hidden; }
   #draw { width: 100%; height: 100%; display: block; touch-action: none; cursor: crosshair; }
 
@@ -95,7 +104,9 @@
 
   <div class="grid">
     <section class="card" aria-label="Pizarra de dibujo">
-      <div class="frame"><div class="board"><canvas id="draw" width="340" height="340"></canvas></div></div>
+      <div class="frame"><div class="board"><canvas id="draw" width="340" height="340"></canvas>
+        <div class="cropLayer" id="cropLayer" hidden><div class="cropbox" id="cropbox"><i data-h="nw"></i><i data-h="ne"></i><i data-h="sw"></i><i data-h="se"></i></div></div>
+      </div></div>
       <div class="toolbar">
         <button class="tool active" id="pencil" title="Lápiz" aria-label="Lápiz">
           <svg viewBox="0 0 24 24"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
@@ -116,6 +127,7 @@
         <button class="tool size" data-size="34" title="Trazo grueso" aria-label="Trazo grueso"><i style="width:16px;height:16px"></i></button>
       </div>
       <p id="hint"></p>
+      <p id="cropHint" hidden>Arrastra el recuadro o sus esquinas para elegir qué parte analizar. Doble toque para volver a toda la imagen.</p>
     </section>
 
     <section class="card" aria-label="Resultado" aria-live="polite">
@@ -142,7 +154,8 @@
   const B = 340, MEAN = 0.1307, STD = 0.3081;
   const $ = (id) => document.getElementById(id);
   const cv = $("draw"), ctx = cv.getContext("2d", { willReadFrequently: true });
-  let tool = "pencil", size = 20, last = null, timer = null, net = null, hasPhoto = false;
+  let tool = "pencil", size = 20, last = null, timer = null, net = null;
+  let photo = null, photoMode = false, cropTouched = false, view = null, crop = null;
 
   // ---------- Dibujo ----------
   const blank = () => { ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, B, B); };
@@ -177,9 +190,9 @@
     $("pencil").classList.toggle("active", t === "pencil");
     $("eraser").classList.toggle("active", t === "eraser");
   };
-  $("pencil").onclick = () => setTool("pencil");
-  $("eraser").onclick = () => setTool("eraser");
-  $("clear").onclick = () => { blank(); hasPhoto = false; idle(); };
+  $("pencil").onclick = () => { if (leavePhoto()) idle(); setTool("pencil"); };
+  $("eraser").onclick = () => { if (leavePhoto()) idle(); setTool("eraser"); };
+  $("clear").onclick = () => { leavePhoto(); blank(); idle(); };
   document.querySelectorAll(".size").forEach((b) => b.onclick = () => {
     size = +b.dataset.size;
     document.querySelectorAll(".size").forEach((x) => x.classList.toggle("active", x === b));
@@ -216,8 +229,8 @@
     return out;
   }
 
-  function preprocess() {
-    const d = ctx.getImageData(0, 0, B, B).data, n = B * B;
+  function preprocess(c2d) {
+    const d = c2d.getImageData(0, 0, B, B).data, n = B * B;
     const g = new Float32Array(n), hist = new Uint32Array(256);
     for (let i = 0; i < n; i++) { g[i] = 0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2]; hist[Math.round(g[i])]++; }
 
@@ -230,7 +243,7 @@
     const thr = otsu(a);
     let mask = new Uint8Array(n);
     for (let i = 0; i < n; i++) mask[i] = a[i] > thr ? 1 : 0;
-    if (hasPhoto) {  // en fotos, ignorar marcos/sombras pegados al borde
+    if (photoMode && !cropTouched) {  // foto completa: ignorar marcos/sombras pegados al borde
       const c = dropBorder(mask, B, B);
       if (c.reduce((s, v) => s + v, 0) >= 15) mask = c;
     }
@@ -277,28 +290,115 @@
   }
 
   // ---------- Subir / arrastrar / pegar una imagen ----------
+  const work = document.createElement("canvas"); work.width = work.height = B;
+  const wctx = work.getContext("2d", { willReadFrequently: true });
+  const tiny = document.createElement("canvas"); tiny.width = tiny.height = 1;
+  const tctx = tiny.getContext("2d", { willReadFrequently: true });
+  const layer = $("cropLayer"), box = $("cropbox");
+
   async function loadImage(file) {
-    if (!file || !file.type.startsWith("image/")) { $("hint").textContent = "Eso no parece una imagen."; return; }
+    if (!file) return;
+    if (!file.type.startsWith("image/")) { $("hint").textContent = "Eso no parece una imagen."; return; }
     try {
-      const bmp = await createImageBitmap(file);
-      blank();
+      const bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
+      leavePhoto();
+      photo = bmp; photoMode = true; cropTouched = false;
       const sc = Math.min(B / bmp.width, B / bmp.height), w = bmp.width * sc, h = bmp.height * sc;
+      view = { x: (B - w) / 2, y: (B - h) / 2, w, h, scale: sc };
+      blank();
       ctx.imageSmoothingQuality = "high";
-      ctx.drawImage(bmp, (B - w) / 2, (B - h) / 2, w, h);
-      if (bmp.close) bmp.close();
-      hasPhoto = true;
-      $("hint").textContent = "";
+      ctx.drawImage(bmp, view.x, view.y, w, h);
+      crop = { x: view.x, y: view.y, w, h };
+      placeCrop();
+      layer.hidden = false; $("cropHint").hidden = false; $("hint").textContent = "";
       schedule(0);
     } catch (e) {
       $("hint").textContent = "No pude abrir esa imagen (¿formato no compatible?).";
     }
   }
+
+  function leavePhoto() {
+    if (!photoMode) return false;
+    photoMode = false; if (photo && photo.close) photo.close(); photo = null;
+    layer.hidden = true; $("cropHint").hidden = true; blank();
+    return true;
+  }
+
+  function placeCrop() {
+    const st = box.style;
+    st.left = crop.x / B * 100 + "%"; st.top = crop.y / B * 100 + "%";
+    st.width = crop.w / B * 100 + "%"; st.height = crop.h / B * 100 + "%";
+  }
+
+  // Dibuja la zona elegida (a resolucion original) en un lienzo de trabajo B x B
+  function renderCrop() {
+    const sc = view.scale;
+    const sx = (crop.x - view.x) / sc, sy = (crop.y - view.y) / sc, sw = crop.w / sc, sh = crop.h / sc;
+    let r = 0, g = 0, bl = 0;
+    for (const [cx, cy] of [[sx, sy], [sx + sw - 1, sy], [sx, sy + sh - 1], [sx + sw - 1, sy + sh - 1]]) {
+      const px = Math.max(0, Math.min(photo.width - 1, Math.floor(cx)));
+      const py = Math.max(0, Math.min(photo.height - 1, Math.floor(cy)));
+      tctx.clearRect(0, 0, 1, 1); tctx.drawImage(photo, px, py, 1, 1, 0, 0, 1, 1);
+      const d = tctx.getImageData(0, 0, 1, 1).data; r += d[0]; g += d[1]; bl += d[2];
+    }
+    wctx.fillStyle = `rgb(${(r / 4) | 0},${(g / 4) | 0},${(bl / 4) | 0})`;  // relleno = color de fondo de la zona
+    wctx.fillRect(0, 0, B, B);
+    const f = Math.min(B / sw, B / sh), dw = sw * f, dh = sh * f;
+    wctx.imageSmoothingQuality = "high";
+    wctx.drawImage(photo, sx, sy, sw, sh, (B - dw) / 2, (B - dh) / 2, dw, dh);
+    return wctx;
+  }
+
+  // Interaccion del recuadro: mover, cambiar tamano con las esquinas, o dibujar uno nuevo
+  const MIN = 24;
+  let drag = null;
+  const lp = (e) => { const r = layer.getBoundingClientRect(); return [(e.clientX - r.left) * (B / r.width), (e.clientY - r.top) * (B / r.height)]; };
+  const clampX = (x) => Math.min(Math.max(x, view.x), view.x + view.w);
+  const clampY = (y) => Math.min(Math.max(y, view.y), view.y + view.h);
+  layer.addEventListener("pointerdown", (e) => {
+    layer.setPointerCapture(e.pointerId);
+    const [x, y] = lp(e), h = e.target.dataset && e.target.dataset.h;
+    if (h) drag = { mode: "resize", h, s: { ...crop } };
+    else if (cropTouched && x >= crop.x && x <= crop.x + crop.w && y >= crop.y && y <= crop.y + crop.h) drag = { mode: "move", ox: x - crop.x, oy: y - crop.y };
+    else drag = { mode: "new", ax: clampX(x), ay: clampY(y) };
+  });
+  const updateDrag = (e) => {
+    if (!drag) return;
+    const [x0, y0] = lp(e), x = clampX(x0), y = clampY(y0);
+    if (drag.mode === "move") {
+      crop.x = Math.min(Math.max(x0 - drag.ox, view.x), view.x + view.w - crop.w);
+      crop.y = Math.min(Math.max(y0 - drag.oy, view.y), view.y + view.h - crop.h);
+    } else if (drag.mode === "new") {
+      const w = Math.max(MIN, Math.abs(x - drag.ax)), h = Math.max(MIN, Math.abs(y - drag.ay));
+      crop = { x: Math.min(Math.min(drag.ax, x), view.x + view.w - w), y: Math.min(Math.min(drag.ay, y), view.y + view.h - h), w, h };
+    } else {
+      const s0 = drag.s; let l = s0.x, t = s0.y, r = s0.x + s0.w, b = s0.y + s0.h;
+      if (drag.h.includes("w")) l = Math.min(x, r - MIN);
+      if (drag.h.includes("e")) r = Math.max(x, l + MIN);
+      if (drag.h.includes("n")) t = Math.min(y, b - MIN);
+      if (drag.h.includes("s")) b = Math.max(y, t + MIN);
+      crop = { x: l, y: t, w: r - l, h: b - t };
+    }
+    cropTouched = true; placeCrop(); schedule(450);
+  };
+  layer.addEventListener("pointermove", updateDrag);
+  const endDrag = (e) => {
+    if (!drag) return;
+    if (e.type === "pointerup") updateDrag(e);  // aplicar la posicion final al soltar
+    drag = null; schedule(0);
+  };
+  layer.addEventListener("pointerup", endDrag);
+  layer.addEventListener("pointercancel", endDrag);
+  layer.addEventListener("dblclick", () => {  // volver a toda la imagen
+    crop = { x: view.x, y: view.y, w: view.w, h: view.h }; cropTouched = false; placeCrop(); schedule(0);
+  });
+
   $("upload").onclick = () => $("file").click();
   $("file").onchange = (e) => { loadImage(e.target.files[0]); e.target.value = ""; };
   const frame = cv.closest(".frame");
   ["dragenter", "dragover"].forEach((t) => frame.addEventListener(t, (e) => { e.preventDefault(); frame.classList.add("drop"); }));
   ["dragleave", "drop"].forEach((t) => frame.addEventListener(t, (e) => { e.preventDefault(); frame.classList.remove("drop"); }));
-  frame.addEventListener("drop", (e) => loadImage(e.dataTransfer.files[0]));
+  frame.addEventListener("drop", (e) => { if (e.dataTransfer.files.length) loadImage(e.dataTransfer.files[0]); });
   document.addEventListener("paste", (e) => {
     const f = [...((e.clipboardData && e.clipboardData.files) || [])].find((x) => x.type.startsWith("image/"));
     if (f) loadImage(f);
@@ -308,7 +408,7 @@
   function predict() {
     timer = null;
     if (!net) return;
-    const img = preprocess();
+    const img = preprocess(photoMode ? renderCrop() : ctx);
     if (!img) return idle();
     const input = Float32Array.from(img, (v) => (v / 255 - MEAN) / STD);
     const p = net.predict(input);
