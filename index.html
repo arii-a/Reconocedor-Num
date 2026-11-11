@@ -39,7 +39,8 @@
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
   @media (max-width: 760px) { .grid { grid-template-columns: 1fr; gap: 20px; } }
   .card { background: var(--card); border-radius: 24px; padding: 20px; box-shadow: var(--shadow); }
-  .frame { background: var(--frame); padding: 4px; border-radius: 10px; }
+  .frame { background: var(--frame); padding: 4px; border-radius: 10px; transition: box-shadow .12s; }
+  .frame.drop { box-shadow: 0 0 0 4px var(--accent); }
   .board { position: relative; aspect-ratio: 1; background: #fff; container-type: inline-size; overflow: hidden; }
   #draw { width: 100%; height: 100%; display: block; touch-action: none; cursor: crosshair; }
 
@@ -56,12 +57,15 @@
   button.size { width: 40px; height: 40px; border-radius: 12px; }
   button.size i { display: block; border-radius: 50%; background: currentColor; }
 
-  @media (max-width: 420px) {
-    .toolbar { gap: 6px; flex-wrap: nowrap; }
-    button.tool { width: 46px; height: 46px; }
-    button.size { width: 34px; height: 34px; }
-    .card { padding: 16px; }
+  .card { container-type: inline-size; }
+  @container (max-width: 410px) {
+    .toolbar { gap: 6px; }
+    .toolbar .sep { display: none; }
+    button.tool { width: 42px; height: 42px; }
+    button.size { width: 32px; height: 32px; }
+    .sep + button.size { margin-left: auto; }
   }
+  @media (max-width: 420px) { .card { padding: 16px; } }
   .out { display: grid; place-items: center; }
   .big { font-size: 58cqw; font-weight: 700; line-height: 1; color: var(--boardink); margin-top: -12cqw; }
   .big.idle { color: #dde0ee; }
@@ -102,6 +106,10 @@
         <button class="tool" id="clear" title="Limpiar todo" aria-label="Limpiar todo">
           <svg viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
         </button>
+        <button class="tool" id="upload" title="Subir imagen" aria-label="Subir imagen">
+          <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m17 8-5-5-5 5"/><path d="M12 3v12"/></svg>
+        </button>
+        <input type="file" id="file" accept="image/*" hidden>
         <span class="sep"></span>
         <button class="tool size" data-size="10" title="Trazo fino" aria-label="Trazo fino"><i style="width:5px;height:5px"></i></button>
         <button class="tool size active" data-size="20" title="Trazo medio" aria-label="Trazo medio"><i style="width:10px;height:10px"></i></button>
@@ -124,7 +132,7 @@
       </div>
     </section>
   </div>
-  <p class="note">Red neuronal convolucional entrenada con MNIST · corre localmente, tu dibujo no se envía a ningún servidor.</p>
+  <p class="note">Dibuja, o sube, arrastra o pega (Ctrl+V) una foto de un dígito. Red neuronal entrenada con MNIST · corre en tu navegador, nada se envía a ningún servidor.</p>
 </main>
 
 <script src="net.js"></script>
@@ -134,7 +142,7 @@
   const B = 340, MEAN = 0.1307, STD = 0.3081;
   const $ = (id) => document.getElementById(id);
   const cv = $("draw"), ctx = cv.getContext("2d", { willReadFrequently: true });
-  let tool = "pencil", size = 20, last = null, timer = null, net = null;
+  let tool = "pencil", size = 20, last = null, timer = null, net = null, hasPhoto = false;
 
   // ---------- Dibujo ----------
   const blank = () => { ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, B, B); };
@@ -171,7 +179,7 @@
   };
   $("pencil").onclick = () => setTool("pencil");
   $("eraser").onclick = () => setTool("eraser");
-  $("clear").onclick = () => { blank(); idle(); };
+  $("clear").onclick = () => { blank(); hasPhoto = false; idle(); };
   document.querySelectorAll(".size").forEach((b) => b.onclick = () => {
     size = +b.dataset.size;
     document.querySelectorAll(".size").forEach((x) => x.classList.toggle("active", x === b));
@@ -182,19 +190,61 @@
   });
 
   // ---------- Preprocesado (igual que preprocess.py) ----------
+  function otsu(a) {
+    const hist = new Float64Array(256);
+    for (let i = 0; i < a.length; i++) hist[Math.min(255, Math.max(0, Math.floor(a[i])))]++;
+    const total = a.length; let sumAll = 0;
+    for (let i = 0; i < 256; i++) sumAll += i * hist[i];
+    let w0 = 0, s0 = 0, best = -1, thr = 128;
+    for (let t = 0; t < 256; t++) {
+      w0 += hist[t];
+      if (w0 === 0 || w0 === total) continue;
+      s0 += t * hist[t];
+      const m0 = s0 / w0, m1 = (sumAll - s0) / (total - w0), v = w0 * (total - w0) * (m0 - m1) ** 2;
+      if (v > best) { best = v; thr = t; }
+    }
+    return thr;
+  }
+
+  // Quita las regiones del primer plano que tocan el borde (marcos, sombras)
+  function dropBorder(mask, w, h) {
+    const out = mask.slice(), st = [];
+    const push = (x, y) => { if (x >= 0 && y >= 0 && x < w && y < h && out[y * w + x]) { out[y * w + x] = 0; st.push(x, y); } };
+    for (let x = 0; x < w; x++) { push(x, 0); push(x, h - 1); }
+    for (let y = 0; y < h; y++) { push(0, y); push(w - 1, y); }
+    while (st.length) { const y = st.pop(), x = st.pop(); push(x + 1, y); push(x - 1, y); push(x, y + 1); push(x, y - 1); }
+    return out;
+  }
+
   function preprocess() {
-    const d = ctx.getImageData(0, 0, B, B).data;
-    const ink = new Float32Array(B * B);  // trazo claro sobre fondo oscuro, 0..255
-    let x0 = B, y0 = B, x1 = -1, y1 = -1;
-    for (let i = 0; i < B * B; i++) {
-      const v = 255 - (0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2]);
-      ink[i] = v < 20 ? 0 : v;
-      if (ink[i] > 0) {
-        const x = i % B, y = (i / B) | 0;
-        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
-      }
+    const d = ctx.getImageData(0, 0, B, B).data, n = B * B;
+    const g = new Float32Array(n), hist = new Uint32Array(256);
+    for (let i = 0; i < n; i++) { g[i] = 0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2]; hist[Math.round(g[i])]++; }
+
+    // Fondo = valor mas comun. MNIST: digito claro sobre fondo oscuro -> invertir si el fondo es claro
+    let acc = 0, med = 0;
+    for (let t = 0; t < 256; t++) { acc += hist[t]; if (acc >= n / 2) { med = t; break; } }
+    const a = new Float32Array(n);
+    for (let i = 0; i < n; i++) a[i] = med > 127 ? 255 - g[i] : g[i];
+
+    const thr = otsu(a);
+    let mask = new Uint8Array(n);
+    for (let i = 0; i < n; i++) mask[i] = a[i] > thr ? 1 : 0;
+    if (hasPhoto) {  // en fotos, ignorar marcos/sombras pegados al borde
+      const c = dropBorder(mask, B, B);
+      if (c.reduce((s, v) => s + v, 0) >= 15) mask = c;
+    }
+
+    let x0 = B, y0 = B, x1 = -1, y1 = -1, amax = 1;
+    for (let i = 0; i < n; i++) if (mask[i]) {
+      const x = i % B, y = (i / B) | 0;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      if (a[i] > amax) amax = a[i];
     }
     if (x1 < 0) return null;
+    const ink = new Float32Array(n);
+    for (let i = 0; i < n; i++) ink[i] = mask[i] ? a[i] / amax * 255 : 0;
+
     const w = x1 - x0 + 1, h = y1 - y0 + 1, s = 20 / Math.max(w, h);
     const tw = Math.max(1, Math.round(w * s)), th = Math.max(1, Math.round(h * s));
 
@@ -208,8 +258,8 @@
         for (let y = Math.floor(sy0); y < Math.ceil(sy1); y++) {
           const wy = Math.min(y + 1, sy1) - Math.max(y, sy0);
           for (let x = Math.floor(sx0); x < Math.ceil(sx1); x++) {
-            const wx = Math.min(x + 1, sx1) - Math.max(x, sx0), a = wx * wy;
-            sum += ink[y * B + x] * a; area += a;
+            const wx = Math.min(x + 1, sx1) - Math.max(x, sx0), ar = wx * wy;
+            sum += ink[y * B + x] * ar; area += ar;
           }
         }
         patch[ty * tw + tx] = sum / area;
@@ -225,6 +275,34 @@
     for (let y = 0; y < th; y++) for (let x = 0; x < tw; x++) img[(oy + y) * 28 + ox + x] = patch[y * tw + x];
     return img;
   }
+
+  // ---------- Subir / arrastrar / pegar una imagen ----------
+  async function loadImage(file) {
+    if (!file || !file.type.startsWith("image/")) { $("hint").textContent = "Eso no parece una imagen."; return; }
+    try {
+      const bmp = await createImageBitmap(file);
+      blank();
+      const sc = Math.min(B / bmp.width, B / bmp.height), w = bmp.width * sc, h = bmp.height * sc;
+      ctx.imageSmoothingQuality = "high";
+      ctx.drawImage(bmp, (B - w) / 2, (B - h) / 2, w, h);
+      if (bmp.close) bmp.close();
+      hasPhoto = true;
+      $("hint").textContent = "";
+      schedule(0);
+    } catch (e) {
+      $("hint").textContent = "No pude abrir esa imagen (¿formato no compatible?).";
+    }
+  }
+  $("upload").onclick = () => $("file").click();
+  $("file").onchange = (e) => { loadImage(e.target.files[0]); e.target.value = ""; };
+  const frame = cv.closest(".frame");
+  ["dragenter", "dragover"].forEach((t) => frame.addEventListener(t, (e) => { e.preventDefault(); frame.classList.add("drop"); }));
+  ["dragleave", "drop"].forEach((t) => frame.addEventListener(t, (e) => { e.preventDefault(); frame.classList.remove("drop"); }));
+  frame.addEventListener("drop", (e) => loadImage(e.dataTransfer.files[0]));
+  document.addEventListener("paste", (e) => {
+    const f = [...((e.clipboardData && e.clipboardData.files) || [])].find((x) => x.type.startsWith("image/"));
+    if (f) loadImage(f);
+  });
 
   // ---------- Prediccion y resultado ----------
   function predict() {
