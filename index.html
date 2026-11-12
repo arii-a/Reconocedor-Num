@@ -278,6 +278,33 @@
     return out;
   }
 
+  // Elimina componentes conexos (8 vecinos) con area < frac * area del componente mayor
+  function dropSmall(mask, w, h, frac) {
+    const N = w * h, lab = new Int32Array(N), sizes = [0], st = [];
+    for (let i = 0; i < N; i++) {
+      if (!mask[i] || lab[i]) continue;
+      const k = sizes.length; let cnt = 0; lab[i] = k; st.push(i);
+      while (st.length) {
+        const p = st.pop(); cnt++;
+        const x = p % w, y = (p / w) | 0;
+        for (let dy = -1; dy <= 1; dy++) {
+          const yy = y + dy; if (yy < 0 || yy >= h) continue;
+          for (let dx = -1; dx <= 1; dx++) {
+            const xx = x + dx; if (xx < 0 || xx >= w) continue;
+            const q = yy * w + xx;
+            if (mask[q] && !lab[q]) { lab[q] = k; st.push(q); }
+          }
+        }
+      }
+      sizes.push(cnt);
+    }
+    let big = 0;
+    for (let k = 1; k < sizes.length; k++) if (sizes[k] > big) big = sizes[k];
+    const out = new Uint8Array(N);
+    for (let i = 0; i < N; i++) if (lab[i] && sizes[lab[i]] >= frac * big) out[i] = 1;
+    return out;
+  }
+
   // Reduccion por promedio de area (caja): region (ox,oy,w,h) de src -> tw x th
   function boxResize(src, stride, ox, oy, w, h, tw, th) {
     const out = new Float32Array(tw * th);
@@ -327,6 +354,7 @@
       }
       return x1 < 0 ? null : { x0, y0, x1, y1 };
     };
+    mask = dropSmall(mask, B, B, 0.02);  // quitar motas sueltas que agrandan el recuadro del digito
     let bb = bbox(mask);
     if (!bb) return null;
 
